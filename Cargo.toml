@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-walkdir = "2.1.0"
+regex = "1.12.3"
+futures-lite = "2.6.1"
+serde_json = "1.0.149"
+serde = { version = "1.0.228", features = ["derive"] }

@@ -4,6 +4,8 @@ use futures_lite::StreamExt;
 use futures_lite::future::block_on;
 use std::path::Path;
 
+static OUTPUT_PATH: &str = "output";
+
 #[derive(Debug)]
 pub struct Repo {
     name: String,
@@ -37,41 +39,40 @@ pub fn repo_commands() -> Command {
         .subcommands([
             Command::new("add")
                 .arg(
-                    Arg::new("path")
-                        .short('p')
-                        .help("path to the repo")
-                        .required(true),
-                )
-                .arg(
                     Arg::new("name")
                         .short('n')
                         .help("name to the repo")
                         .required(true),
+                )
+                .arg(
+                    Arg::new("path")
+                        .short('p')
+                        .help("path to the repo")
+                        .required(true),
                 ),
-            Command::new("delete").arg(Arg::new("name").help("name to the repo").required(true)),
+            Command::new("del").arg(Arg::new("name").help("name to the repo").required(true)),
         ])
 }
 
 pub fn repo_handle_commands(matches: &ArgMatches) {
     match matches.subcommand() {
         Some(("add", sub_matches)) => {
-            println!("add");
+            let query = AddQuery::parse(sub_matches);
+            repo_add(query);
         }
-        Some(("delete", sub_matches)) => {
-            println!("delete");
+        Some(("del", sub_matches)) => {
+            let query = DeleteQuery::parse(sub_matches);
+            repo_delete(query);
         }
         _ => unreachable!("unknown subcommand"),
     }
 }
 
-pub fn add(path: &str, name: &str) -> bool {
-    let output_path = "output";
-    println!("build on: {path}, exported to {output_path}");
-    let files = walk_dir(path);
+fn repo_add(query: AddQuery) -> bool {
+    false
+}
 
-    let repo = Repo::new(path.to_string(), path.to_string(), files);
-    println!("repo :{:?}", repo);
-
+fn repo_delete(query: DeleteQuery) -> bool {
     false
 }
 
@@ -110,4 +111,78 @@ fn walk_dir(path_str: &str) -> Vec<String> {
         });
     }
     files
+}
+
+use crate::query::query::Query;
+#[derive(Debug, Eq, PartialEq)]
+struct AddQuery {
+    repo: String,
+    path: String,
+}
+
+impl Query for AddQuery {
+    fn parse(matches: &ArgMatches) -> Self {
+        let repo = matches
+            .get_one::<String>("name")
+            .expect("repo name is required");
+
+        let path = matches
+            .get_one::<String>("path")
+            .expect("repo path is required");
+
+        AddQuery {
+            repo: repo.to_string(),
+            path: path.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DeleteQuery {
+    repo: String,
+}
+
+impl Query for DeleteQuery {
+    fn parse(matches: &ArgMatches) -> Self {
+        let repo = matches
+            .get_one::<String>("name")
+            .expect("repo name is required");
+
+        DeleteQuery {
+            repo: repo.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repo_add() {
+        let expected = AddQuery {
+            repo: String::from("repo"),
+            path: String::from("path"),
+        };
+
+        let binding =
+            repo_commands().get_matches_from(vec!["repo", "add", "-n", "repo", "-p", "path"]);
+        let matches = binding.subcommand_matches("add").expect("repo add");
+
+        let query = AddQuery::parse(matches);
+        assert_eq!(expected, query);
+    }
+
+    #[test]
+    fn test_repo_delete() {
+        let expected = DeleteQuery {
+            repo: String::from("repo"),
+        };
+
+        let binding = repo_commands().get_matches_from(vec!["repo", "del", "repo"]);
+        let matches = binding.subcommand_matches("del").expect("repo del");
+
+        let query = DeleteQuery::parse(&matches);
+        assert_eq!(expected, query);
+    }
 }

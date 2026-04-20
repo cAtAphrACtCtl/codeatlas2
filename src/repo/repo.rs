@@ -1,8 +1,6 @@
-use async_walkdir::{Filtering, WalkDir};
 use clap::{Arg, ArgMatches, Command};
-use futures_lite::StreamExt;
-use futures_lite::future::block_on;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 static OUTPUT_PATH: &str = "output";
 
@@ -68,7 +66,19 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
     }
 }
 
-fn repo_add(query: AddQuery) -> bool {
+fn repo_add(mut query: AddQuery) -> bool {
+    if query.path.is_relative() {
+        query.path = Path::new(&query.path)
+            .canonicalize()
+            .expect("the relative path provided does not exist");
+    }
+
+    let files = walk_dir(query.path.as_path());
+
+    println!("repo name: {}", query.repo);
+    for file in files {
+        println!("{}", file.display());
+    }
     false
 }
 
@@ -76,48 +86,36 @@ fn repo_delete(query: DeleteQuery) -> bool {
     false
 }
 
-fn walk_dir(path_str: &str) -> Vec<String> {
-    let mut files = Vec::new();
-    let path = Path::new(path_str);
+fn walk_dir(path: &Path) -> Vec<PathBuf> {
+    let mut files:Vec<PathBuf> = Vec::new();
     if path.is_file() {
-        files.push(path_str.to_string());
+        files.push(PathBuf::from(path));
     } else {
-        block_on(async {
-            let mut entries = WalkDir::new(path).filter(|p| async move {
-                if let Some(true) = p
-                    .path()
-                    .file_name()
-                    .map(|f| f.to_string_lossy().ends_with(".rs"))
-                {
-                    Filtering::Continue
-                } else {
-                    Filtering::Ignore
-                }
-            });
-            loop {
-                match entries.next().await {
-                    Some(Ok(entry)) => {
-                        if let Some(file_name) = entry.path().to_str() {
-                            files.push(file_name.to_string());
-                        }
+        for entry in WalkDir::new(path) {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(rs_file) = path.extension() && rs_file == "rs" {
+                        files.push(entry.path().to_owned());
                     }
-                    Some(Err(e)) => {
-                        eprintln!("error when walking repo path:{e}");
-                        eprintln!("error:{e}");
-                    }
-                    None => break,
+
+                }else if path.is_dir() {
+                    continue;
                 }
+            }else {
+                println!("unable to read {:?}", path);
             }
-        });
+
+        }
     }
     files
 }
 
 use crate::query::query::Query;
 #[derive(Debug, Eq, PartialEq)]
-struct AddQuery {
+pub(super) struct AddQuery {
     repo: String,
-    path: String,
+    path: PathBuf,
 }
 
 impl Query for AddQuery {
@@ -132,7 +130,7 @@ impl Query for AddQuery {
 
         AddQuery {
             repo: repo.to_string(),
-            path: path.to_string(),
+            path: PathBuf::from(path),
         }
     }
 }
@@ -162,7 +160,7 @@ mod tests {
     fn test_repo_add() {
         let expected = AddQuery {
             repo: String::from("repo"),
-            path: String::from("path"),
+            path: PathBuf::from("path"),
         };
 
         let binding =

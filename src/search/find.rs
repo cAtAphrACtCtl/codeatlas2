@@ -14,7 +14,7 @@ pub fn find_commands() -> Command {
         .arg(Arg::new("repo").help("search in repo").short('r'))
         .group(
             ArgGroup::new("search_scope")
-                .args(&["dir", "repo"])
+                .args(["dir", "repo"])
                 .multiple(false),
         )
 }

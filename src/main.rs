@@ -5,12 +5,8 @@ mod search;
 use crate::repo::repo::{repo_commands, repo_handle_commands};
 use crate::search::find::{find_commands, find_handle_command};
 use clap::Command;
-use futures_lite::StreamExt;
-use std::env;
 
 fn main() {
-    let path = env::current_dir().expect("failed to get current directory");
-
     let cmd = Command::new("atlas")
         .version("0.0.1")
         .author("cAtAphrACtCtl")

@@ -5,23 +5,42 @@ use walkdir::WalkDir;
 static OUTPUT_PATH: &str = "output";
 
 #[derive(Debug)]
-pub struct Repo {
+pub(crate) struct Repo {
     name: String,
-    path: String,
-    files: Vec<String>,
+    path: PathBuf,
+    files: Vec<PathBuf>,
 }
 
 impl Repo {
-    pub fn new(name: String, path: String, files: Vec<String>) -> Repo {
+    pub(crate) fn new(name: String, path: PathBuf, files: Vec<PathBuf>) -> Repo {
         Repo { name, path, files }
     }
+
+    pub(crate) fn build(&self) -> Vec<Symbol>{
+        let mut symbols = Vec::new();
+        for file in &self.files {
+            if let Ok(source)  = std::fs::read_to_string(file){
+            } else { 
+                println!("Error reading file: {}", file.display());
+            }
+        }
+
+        symbols
+    }
+}
+
+#[derive(Debug)]
+enum SymbolInfo{
+    Function(String),
+    Struct(String),
+    Import(String),
 }
 
 #[derive(Debug)]
 pub struct Symbol {
     language: String,
     name: String,
-    kind: String,
+    info: SymbolInfo,
     location: SymbolLocation,
 }
 #[derive(Debug)]
@@ -56,7 +75,9 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
     match matches.subcommand() {
         Some(("add", sub_matches)) => {
             let query = AddQuery::parse(sub_matches);
-            repo_add(query);
+            let repo = repo_add(query);
+            repo.build();
+
         }
         Some(("del", sub_matches)) => {
             let query = DeleteQuery::parse(sub_matches);
@@ -66,7 +87,7 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
     }
 }
 
-fn repo_add(mut query: AddQuery) -> bool {
+fn repo_add(mut query: AddQuery) -> Repo {
     if query.path.is_relative() {
         query.path = Path::new(&query.path)
             .canonicalize()
@@ -75,11 +96,7 @@ fn repo_add(mut query: AddQuery) -> bool {
 
     let files = walk_dir(query.path.as_path());
 
-    println!("repo name: {}", query.repo);
-    for file in files {
-        println!("{}", file.display());
-    }
-    false
+    Repo::new(query.repo, query.path, files)
 }
 
 fn repo_delete(query: DeleteQuery) -> bool {

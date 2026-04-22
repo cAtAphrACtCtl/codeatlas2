@@ -1,9 +1,8 @@
 use clap::{Arg, ArgMatches, Command};
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write, read_to_string};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Output;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use walkdir::WalkDir;
 
@@ -153,7 +152,7 @@ impl Repo {
 
         let file = File::create(output_file)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &self).map_err((std::io::Error::other))?;
+        serde_json::to_writer_pretty(&mut writer, &self).map_err(std::io::Error::other)?;
         writer.flush()?;
 
         Ok(())
@@ -252,7 +251,7 @@ fn repo_add(mut query: AddQuery) -> std::io::Result<Repo> {
     Ok(Repo::new(query.repo, query.path, files))
 }
 
-fn repo_delete(query: DeleteQuery) -> bool {
+fn repo_delete(_query: DeleteQuery) -> bool {
     false
 }
 

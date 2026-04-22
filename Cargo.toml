@@ -11,3 +11,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 clap = "4.6.0"
 tree-sitter = "0.26.8"
 walkdir = "2.5.0"
+tree-sitter-rust = "0.24.2"

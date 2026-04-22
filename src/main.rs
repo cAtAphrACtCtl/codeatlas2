@@ -2,6 +2,7 @@ mod query;
 mod repo;
 mod search;
 
+use std::time::Instant;
 use crate::repo::repo::{repo_commands, repo_handle_commands};
 use crate::search::find::{find_commands, find_handle_command};
 use clap::Command;
@@ -14,9 +15,14 @@ fn main() {
         .subcommands([repo_commands(), find_commands()]);
 
     let matches = cmd.get_matches();
+
+    let now = Instant::now();
     match matches.subcommand() {
         Some(("repo", sub_matches)) => repo_handle_commands(sub_matches),
         Some(("find", sub_matches)) => find_handle_command(sub_matches),
         _ => unreachable!("unknown subcommand"),
     }
+
+    let elpased = Instant::now() - now;
+    println!("finished with duration = {:?}", elpased);
 }

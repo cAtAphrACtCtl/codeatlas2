@@ -26,21 +26,40 @@ impl Repo {
         }
     }
 
+    fn repo_root(&self) -> &Path {
+        repo_root(self.path.as_path())
+    }
+
+    fn resolve_file_path(&self, file: &Path) -> PathBuf {
+        if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            self.repo_root().join(file)
+        }
+    }
+
     fn extract_symbols(&self) -> Vec<Symbol> {
         let mut parser = get_parser();
         let mut symbols = Vec::new();
         let language = &tree_sitter_rust::LANGUAGE.into();
         for file in &self.files {
-            let source = match std::fs::read_to_string(file) {
+            let file_path = self.resolve_file_path(file);
+            let source = match std::fs::read_to_string(&file_path) {
                 Ok(s) => s,
                 Err(_) => {
-                    eprintln!("Unable to read source file: {}", file.display());
+                    eprintln!("Unable to read source file: {}", file_path.display());
                     continue;
                 }
             };
 
             let source_bytes = source.as_bytes();
-            let tree = parser.parse(&source, None).unwrap();
+            let tree = match parser.parse(&source, None) {
+                Some(tree) => tree,
+                None => {
+                    eprintln!("Unable to parse source file: {}", file_path.display());
+                    continue;
+                }
+            };
             symbols.append(
                 self.query_symbols(
                     language,
@@ -48,9 +67,18 @@ impl Repo {
                     &tree,
                     &source,
                     |node: &Node| {
-                        let text = node.utf8_text(source_bytes).unwrap();
+                        let text = match node.utf8_text(source_bytes) {
+                            Ok(text) => text,
+                            Err(_) => {
+                                eprintln!(
+                                    "Unable to read import text from source file: {}",
+                                    file_path.display()
+                                );
+                                return None;
+                            }
+                        };
                         let pos = node.start_position();
-                        Symbol {
+                        Some(Symbol {
                             language: node
                                 .language()
                                 .name()
@@ -58,11 +86,11 @@ impl Repo {
                                 .to_string(),
                             info: SymbolInfo::Import(String::from(text)),
                             location: SymbolLocation {
-                                file: file.display().to_string(),
+                                file: file_path.display().to_string(),
                                 line: pos.row + 1,
                                 col: pos.column + 1,
                             },
-                        }
+                        })
                     },
                 )
                 .as_mut(),
@@ -85,7 +113,7 @@ impl Repo {
                                 .collect::<Vec<_>>()
                         });
 
-                        Symbol {
+                        Some(Symbol {
                             language: node
                                 .language()
                                 .name()
@@ -101,11 +129,11 @@ impl Repo {
                                 args,
                             }),
                             location: SymbolLocation {
-                                file: file.display().to_string(),
+                                file: file_path.display().to_string(),
                                 line: pos.row + 1,
                                 col: pos.column + 1,
                             },
-                        }
+                        })
                     },
                 )
                 .as_mut(),
@@ -124,7 +152,7 @@ impl Repo {
         mut builder: F,
     ) -> Vec<Symbol>
     where
-        F: FnMut(&tree_sitter::Node) -> Symbol,
+        F: FnMut(&tree_sitter::Node) -> Option<Symbol>,
     {
         let query = match Query::new(language, query) {
             Ok(q) => q,
@@ -138,7 +166,9 @@ impl Repo {
         let mut symbols = Vec::new();
         while let Some(m) = matches.next() {
             for c in m.captures.iter() {
-                symbols.push(builder(&c.node));
+                if let Some(symbol) = builder(&c.node) {
+                    symbols.push(symbol);
+                }
             }
         }
 
@@ -243,11 +273,8 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
 }
 
 fn repo_add(mut query: AddQuery) -> std::io::Result<Repo> {
-    if query.path.is_relative() {
-        query.path = Path::new(&query.path)
-            .canonicalize()?
-    }
-    let files = walk_dir(query.path.as_path());
+    query.path = query.path.canonicalize()?;
+    let files = relativize_files(query.path.as_path(), walk_dir(query.path.as_path()));
     Ok(Repo::new(query.repo, query.path, files))
 }
 
@@ -278,6 +305,27 @@ fn walk_dir(path: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+fn repo_root(path: &Path) -> &Path {
+    if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+fn relativize_files(base_path: &Path, files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let root = repo_root(base_path);
+
+    files
+        .into_iter()
+        .map(|file| {
+            file.strip_prefix(root)
+                .unwrap_or(file.as_path())
+                .to_path_buf()
+        })
+        .collect()
 }
 
 fn get_parser() -> Parser {
@@ -333,6 +381,10 @@ impl CommandQuery for DeleteQuery {
 mod tests {
     use super::*;
 
+    fn fixture_path(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
     #[test]
     fn test_repo_add() {
         let expected = AddQuery {
@@ -359,5 +411,56 @@ mod tests {
 
         let query = DeleteQuery::parse(&matches);
         assert_eq!(expected, query);
+    }
+
+    #[test]
+    fn test_repo_add_stores_directory_files_as_relative_paths() {
+        let repo_path = fixture_path("unittest/repos/dir_case");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path.clone(),
+        })
+        .expect("repo add");
+
+        let mut files = repo.files;
+        files.sort();
+
+        let mut expected = vec![
+            PathBuf::from("src").join("lib.rs"),
+            PathBuf::from("src").join("nested").join("mod.rs"),
+        ];
+        expected.sort();
+
+        assert_eq!(repo_path.canonicalize().expect("canonical repo path"), repo.path);
+        assert_eq!(expected, files);
+    }
+
+    #[test]
+    fn test_repo_add_stores_single_file_as_relative_path() {
+        let repo_path = fixture_path("unittest/repos/single_file/standalone.rs");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path.clone(),
+        })
+        .expect("repo add");
+
+        assert_eq!(repo_path.canonicalize().expect("canonical file path"), repo.path);
+        assert_eq!(vec![PathBuf::from("standalone.rs")], repo.files);
+    }
+
+    #[test]
+    fn test_extract_symbols_reads_relative_repo_files() {
+        let repo_path = fixture_path("src/repo").canonicalize().expect("repo dir");
+        let repo = Repo::new(
+            String::from("repo"),
+            repo_path,
+            vec![PathBuf::from("repo.rs")],
+        );
+
+        let symbols = repo.extract_symbols();
+
+        assert!(!symbols.is_empty());
     }
 }

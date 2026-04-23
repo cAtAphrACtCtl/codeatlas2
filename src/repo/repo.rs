@@ -3,31 +3,90 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use walkdir::WalkDir;
 
 static OUTPUT_PATH: &str = "output";
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd,
+)]
+pub struct RepoId(u64);
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd, Ord,
+)]
+pub struct FileId(u64);
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd,
+)]
+pub struct SymbolId(u64);
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd,
+)]
+pub struct EdgeId(u64);
+
+trait IdType {
+    fn from_raw(id: u64) -> Self;
+}
+impl IdType for RepoId {
+    fn from_raw(id: u64) -> RepoId {
+        RepoId(id)
+    }
+}
+impl IdType for FileId {
+    fn from_raw(id: u64) -> FileId {
+        FileId(id)
+    }
+}
+impl IdType for SymbolId {
+    fn from_raw(id: u64) -> SymbolId {
+        SymbolId(id)
+    }
+}
+
+impl IdType for EdgeId {
+    fn from_raw(id: u64) -> EdgeId {
+        EdgeId(id)
+    }
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn get_id<T: IdType>() -> T {
+    T::from_raw(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialOrd, PartialEq, Ord, Eq)]
+pub(crate) struct FileNode {
+    id: FileId,
+    path: PathBuf,
+    language: LanguageKind,
+}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Repo {
+    id: RepoId,
     name: String,
-    path: PathBuf,
-    files: Vec<PathBuf>,
-    symbols: Vec<Symbol>,
+    root_path: PathBuf,
+    files: Vec<FileNode>,
+    symbols: Vec<SymbolNode>,
+    edges: Vec<Edge>,
 }
 
 impl Repo {
-    pub(crate) fn new(name: String, path: PathBuf, files: Vec<PathBuf>) -> Repo {
+    pub(crate) fn new(name: String, path: PathBuf, files: Vec<FileNode>) -> Repo {
         Repo {
+            id: get_id(),
             name,
-            path,
+            root_path: path,
             files,
             symbols: vec![],
+            edges: vec![],
         }
     }
 
     fn repo_root(&self) -> &Path {
-        repo_root(self.path.as_path())
+        repo_root(self.root_path.as_path())
     }
 
     fn resolve_file_path(&self, file: &Path) -> PathBuf {
@@ -38,13 +97,14 @@ impl Repo {
         }
     }
 
-    fn extract_symbols(&self) -> Vec<Symbol> {
+    fn extract_symbols(&self) -> Vec<SymbolNode> {
         let mut parser = get_parser();
         let mut symbols = Vec::new();
         let language = &tree_sitter_rust::LANGUAGE.into();
         for file in &self.files {
-            let file_path = self.resolve_file_path(file);
-            let source = match std::fs::read_to_string(&file_path) {
+            let file_path = self.resolve_file_path(&file.path);
+
+            let source = match fs::read_to_string(&file_path) {
                 Ok(s) => s,
                 Err(_) => {
                     eprintln!("Unable to read source file: {}", file_path.display());
@@ -78,17 +138,23 @@ impl Repo {
                             }
                         };
                         let pos = node.start_position();
-                        Some(Symbol {
-                            language: node
-                                .language()
-                                .name()
-                                .unwrap_or_else(|| "unknow because the parser is old")
-                                .to_string(),
-                            info: SymbolInfo::Import(String::from(text)),
-                            location: SymbolLocation {
-                                file: file_path.display().to_string(),
-                                line: pos.row + 1,
-                                col: pos.column + 1,
+                        let import = ImportInfo {
+                            import_path: String::from(text),
+                            alias: None,
+                            is_glob: false,
+                        };
+
+                        Some(SymbolNode {
+                            id: get_id(),
+                            file: file.id,
+                            name: String::from(text),
+                            module_path: None,
+                            info: SymbolInfo::Import(import),
+                            span: Span {
+                                start_line: pos.row + 1,
+                                start_col: pos.column + 1,
+                                end_line: 0,
+                                end_col: 0,
                             },
                         })
                     },
@@ -101,7 +167,7 @@ impl Repo {
                     r#"(function_item) @function"#,
                     &tree,
                     &source,
-                    |node: &tree_sitter::Node /* Type */| {
+                    |node: &Node /* Type */| {
                         let pos = node.start_position();
                         let args = node.child_by_field_name("parameters").map(|params| {
                             let mut cursor = params.walk();
@@ -112,26 +178,22 @@ impl Repo {
                                 .map(|text| text.to_string())
                                 .collect::<Vec<_>>()
                         });
-
-                        Some(Symbol {
-                            language: node
-                                .language()
-                                .name()
-                                .unwrap_or_else(|| "unknow because the parser is old")
-                                .to_string(),
-                            info: SymbolInfo::Function(FunctionInfo {
-                                name: String::from(
-                                    node.child_by_field_name("name")
-                                        .and_then(|n| n.utf8_text(source_bytes).ok())
-                                        .unwrap_or("unknown")
-                                        .to_string(),
-                                ),
-                                args,
-                            }),
-                            location: SymbolLocation {
-                                file: file_path.display().to_string(),
-                                line: pos.row + 1,
-                                col: pos.column + 1,
+                        let name = node
+                            .child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(source_bytes).ok())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        Some(SymbolNode {
+                            id: get_id(),
+                            file: file.id,
+                            name: String::from(&name),
+                            module_path: None,
+                            info: SymbolInfo::Function(FunctionInfo { args }),
+                            span: Span {
+                                start_line: pos.row + 1,
+                                start_col: pos.column + 1,
+                                end_line: pos.row,
+                                end_col: 0,
                             },
                         })
                     },
@@ -150,9 +212,9 @@ impl Repo {
         tree: &Tree,
         source: &str,
         mut builder: F,
-    ) -> Vec<Symbol>
+    ) -> Vec<SymbolNode>
     where
-        F: FnMut(&tree_sitter::Node) -> Option<Symbol>,
+        F: FnMut(&Node) -> Option<SymbolNode>,
     {
         let query = match Query::new(language, query) {
             Ok(q) => q,
@@ -193,33 +255,69 @@ impl Repo {
 enum SymbolInfo {
     Function(FunctionInfo),
     Struct(StructInfo),
-    Import(String),
+    Import(ImportInfo),
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct FunctionInfo {
-    name: String,
     args: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StructInfo {
-    name: String,
     members: Vec<String>,
-    functions: Option<FunctionInfo>,
+}
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ImportInfo {
+    import_path: String,
+    alias: Option<String>,
+    is_glob: bool,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct Symbol {
-    language: String,
+pub struct SymbolNode {
+    id: SymbolId,
+    file: FileId,
+    name: String,
+    module_path: Option<String>,
     info: SymbolInfo,
-    location: SymbolLocation,
+    span: Span,
 }
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct SymbolLocation {
-    file: String,
-    line: usize,
-    col: usize,
+pub struct Span {
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct Edge {
+    id: EdgeId,
+    kind: EdgeKind,
+    from: NodeRef,
+    to: NodeRef,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+enum NodeRef {
+    Repo(RepoId),
+    File(FileId),
+    Symbol(SymbolId),
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+enum EdgeKind {
+    Contain,
+    Define,
+    Import,
+    Call,
+    Reference,
+    Implement,
+}
+#[derive(Debug, serde::Deserialize, serde::Serialize, Eq, Ord, PartialEq, PartialOrd)]
+enum LanguageKind {
+    Rust,
 }
 
 pub fn repo_commands() -> Command {
@@ -247,7 +345,7 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
     match matches.subcommand() {
         Some(("add", sub_matches)) => {
             let query = AddQuery::parse(sub_matches);
-            let mut repo= match repo_add(query) {
+            let mut repo = match repo_add(query) {
                 Ok(repo) => repo,
                 Err(e) => {
                     eprintln!("Failed to add repo {}", e);
@@ -275,6 +373,14 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
 fn repo_add(mut query: AddQuery) -> std::io::Result<Repo> {
     query.path = query.path.canonicalize()?;
     let files = relativize_files(query.path.as_path(), walk_dir(query.path.as_path()));
+    let files = files
+        .into_iter()
+        .map(|f| FileNode {
+            id: get_id(),
+            path: f,
+            language: LanguageKind::Rust,
+        })
+        .collect::<Vec<_>>();
     Ok(Repo::new(query.repo, query.path, files))
 }
 
@@ -380,6 +486,9 @@ impl CommandQuery for DeleteQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn fixture_path(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
@@ -423,7 +532,8 @@ mod tests {
         })
         .expect("repo add");
 
-        let mut files = repo.files;
+        let files = repo.files;
+        let mut files = files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
         files.sort();
 
         let mut expected = vec![
@@ -432,7 +542,10 @@ mod tests {
         ];
         expected.sort();
 
-        assert_eq!(repo_path.canonicalize().expect("canonical repo path"), repo.path);
+        assert_eq!(
+            repo_path.canonicalize().expect("canonical repo path"),
+            repo.root_path
+        );
         assert_eq!(expected, files);
     }
 
@@ -446,21 +559,67 @@ mod tests {
         })
         .expect("repo add");
 
-        assert_eq!(repo_path.canonicalize().expect("canonical file path"), repo.path);
-        assert_eq!(vec![PathBuf::from("standalone.rs")], repo.files);
+        assert_eq!(
+            repo_path.canonicalize().expect("canonical file path"),
+            repo.root_path
+        );
+
+        let files = repo.files;
+        let mut files = files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(vec![PathBuf::from("standalone.rs")], files);
     }
 
     #[test]
     fn test_extract_symbols_reads_relative_repo_files() {
         let repo_path = fixture_path("src/repo").canonicalize().expect("repo dir");
-        let repo = Repo::new(
-            String::from("repo"),
-            repo_path,
-            vec![PathBuf::from("repo.rs")],
-        );
+        let file_node = FileNode {
+            id: FileId(1),
+            path: PathBuf::from("repo.rs"),
+            language: LanguageKind::Rust,
+        };
+        let repo = Repo::new(String::from("repo"), repo_path, vec![file_node]);
 
         let symbols = repo.extract_symbols();
 
         assert!(!symbols.is_empty());
+    }
+
+    #[test]
+    fn test_repo_new_assigns_unique_ids() {
+        let repo1 = Repo::new(String::from("repo1"), PathBuf::from("path1"), vec![]);
+        let repo2 = Repo::new(String::from("repo2"), PathBuf::from("path2"), vec![]);
+
+        assert_ne!(repo1.id, repo2.id);
+        assert!(repo1.id > RepoId(0));
+        assert!(repo2.id > RepoId(0));
+    }
+
+    #[test]
+    fn test_get_id_is_unique_across_threads() {
+        let thread_count = 32;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let i: RepoId = get_id();
+                    i
+                })
+            })
+            .collect();
+
+        let ids: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread should finish"))
+            .collect();
+
+        let unique_ids: HashSet<_> = ids.iter().copied().collect();
+
+        assert_eq!(thread_count, ids.len());
+        assert_eq!(thread_count, unique_ids.len());
+        assert!(ids.into_iter().all(|id| id > RepoId(0)));
     }
 }

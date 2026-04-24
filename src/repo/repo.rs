@@ -1,5 +1,5 @@
+use crate::extraction::rs::extraction::{extract_import_info, extract_span, module_path_for_file, rs_extract_functions, rs_extract_imports};
 use clap::{Arg, ArgMatches, Command};
-use crate::extraction::rs::extraction::{extract_import_info, extract_span, module_path_for_file};
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -16,7 +16,7 @@ pub(crate) struct RepoId(u64);
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd, Ord,
 )]
-pub struct FileId(u64);
+pub struct FileId(pub(crate) u64);
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd,
 )]
@@ -53,15 +53,15 @@ impl IdType for EdgeId {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn get_id<T: IdType>() -> T {
+pub(crate) fn get_id<T: IdType>() -> T {
     T::from_raw(NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, PartialOrd, PartialEq, Ord, Eq)]
 pub(crate) struct FileNode {
-    id: FileId,
-    path: PathBuf,
-    language: LanguageKind,
+    pub(crate) id: FileId,
+    pub(crate) path: PathBuf,
+    pub(crate) language: LanguageKind,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -101,7 +101,6 @@ impl Repo {
     fn extract_symbols(&self) -> Vec<SymbolNode> {
         let mut parser = get_parser();
         let mut symbols = Vec::new();
-        let language = &tree_sitter_rust::LANGUAGE.into();
         for file in &self.files {
             let file_path = self.resolve_file_path(&file.path);
             let module_path = module_path_for_file(&file.path);
@@ -122,97 +121,8 @@ impl Repo {
                     continue;
                 }
             };
-            symbols.append(
-                self.query_symbols(
-                    language,
-                    r#"(use_declaration) @import"#,
-                    &tree,
-                    &source,
-                    |node: &Node| {
-                        extract_import_info(node, source_bytes)
-                            .into_iter()
-                            .map(|import| {
-                                let name = import
-                                    .alias
-                                    .clone()
-                                    .unwrap_or_else(|| import.import_path.clone());
-                                SymbolNode {
-                                    id: get_id(),
-                                    file: file.id,
-                                    name,
-                                    module_path: Some(module_path.clone()),
-                                    info: SymbolInfo::Import(import),
-                                    span: extract_span(node),
-                                }
-                            })
-                            .collect()
-                    },
-                )
-                .as_mut(),
-            );
-            symbols.append(
-                self.query_symbols(
-                    language,
-                    r#"(function_item) @function"#,
-                    &tree,
-                    &source,
-                    |node: &Node| {
-                        let args = node.child_by_field_name("parameters").map(|params| {
-                            let mut cursor = params.walk();
-                            params
-                                .named_children(&mut cursor)
-                                .filter(|n| matches!(n.kind(), "parameter" | "self_parameter"))
-                                .filter_map(|n| n.utf8_text(source_bytes).ok())
-                                .map(|text| text.to_string())
-                                .collect::<Vec<_>>()
-                        });
-                        let name = node
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source_bytes).ok())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        vec![SymbolNode {
-                            id: get_id(),
-                            file: file.id,
-                            name: String::from(&name),
-                            module_path: Some(module_path.clone()),
-                            info: SymbolInfo::Function(FunctionInfo { args }),
-                            span: extract_span(node),
-                        }]
-                    },
-                )
-                .as_mut(),
-            );
-        }
-
-        symbols
-    }
-
-    fn query_symbols<F>(
-        &self,
-        language: &Language,
-        query: &str,
-        tree: &Tree,
-        source: &str,
-        mut builder: F,
-    ) -> Vec<SymbolNode>
-    where
-        F: FnMut(&Node) -> Vec<SymbolNode>,
-    {
-        let query = match Query::new(language, query) {
-            Ok(q) => q,
-            Err(_) => {
-                eprintln!("Unable to parse query: {}", query);
-                return vec![];
-            }
-        };
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-        let mut symbols = Vec::new();
-        while let Some(m) = matches.next() {
-            for c in m.captures.iter() {
-                symbols.extend(builder(&c.node));
-            }
+            symbols.append(rs_extract_imports(&tree, &source, &file, &module_path).as_mut());
+            symbols.append(rs_extract_functions(&tree, &source, &file, &module_path).as_mut());
         }
 
         symbols
@@ -233,7 +143,7 @@ impl Repo {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-enum SymbolInfo {
+pub(crate) enum SymbolInfo {
     Function(FunctionInfo),
     Struct(StructInfo),
     Import(ImportInfo),
@@ -241,7 +151,7 @@ enum SymbolInfo {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct FunctionInfo {
-    args: Option<Vec<String>>,
+    pub(crate) args: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -253,16 +163,18 @@ pub(crate) struct ImportInfo {
     pub(crate) import_path: String,
     pub(crate) alias: Option<String>,
     pub(crate) is_glob: bool,
+    pub(crate) resolved_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct SymbolNode {
-    id: SymbolId,
-    file: FileId,
-    name: String,
-    module_path: Option<String>,
-    info: SymbolInfo,
-    span: Span,
+pub(crate) struct SymbolNode {
+    pub(crate) id: SymbolId,
+    pub(crate) file: FileId,
+    pub(crate) name: String,
+    pub(crate) qualified_name: String,
+    pub(crate) module_path: Option<String>,
+    pub(crate) info: SymbolInfo,
+    pub(crate) span: Span,
 }
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Span {
@@ -297,7 +209,7 @@ enum EdgeKind {
     Implement,
 }
 #[derive(Debug, serde::Deserialize, serde::Serialize, Eq, Ord, PartialEq, PartialOrd)]
-enum LanguageKind {
+pub(crate) enum LanguageKind {
     Rust,
 }
 
@@ -628,6 +540,7 @@ mod tests {
                 import_path: String::from("std::fs"),
                 alias: None,
                 is_glob: false,
+                resolved_path: None,
             }]
         );
     }
@@ -641,6 +554,7 @@ mod tests {
                 import_path: String::from("std::fs"),
                 alias: Some(String::from("file_system")),
                 is_glob: false,
+                resolved_path: None,
             }]
         );
     }
@@ -654,6 +568,7 @@ mod tests {
                 import_path: String::from("std::io::*"),
                 alias: None,
                 is_glob: true,
+                resolved_path: None,
             }]
         );
     }
@@ -668,13 +583,64 @@ mod tests {
                     import_path: String::from("std::io::BufWriter"),
                     alias: None,
                     is_glob: false,
+                    resolved_path: None,
                 },
                 ImportInfo {
                     import_path: String::from("std::io::Write"),
                     alias: None,
                     is_glob: false,
+                    resolved_path: None,
                 }
             ]
         );
+    }
+
+    #[test]
+    fn test_rs_extract_functions_sets_module_and_qualified_name() {
+        let mut parser = get_parser();
+        let source = "fn demo(a: i32) {}\n";
+        let tree = parser.parse(source, None).expect("parse source");
+        let file_node = FileNode {
+            id: FileId(1),
+            path: PathBuf::from("repo.rs"),
+            language: LanguageKind::Rust,
+        };
+
+        let symbols = rs_extract_functions(&tree, source, &file_node, "repo");
+        assert_eq!(symbols.len(), 1);
+
+        let symbol = &symbols[0];
+        assert_eq!(symbol.module_path.as_deref(), Some("crate::repo"));
+        assert_eq!(symbol.qualified_name, "crate::repo::demo");
+    }
+
+    #[test]
+    fn test_rs_extract_imports_sets_resolved_module_and_qualified_name() {
+        let mut parser = get_parser();
+        let source = "use self::inner::Thing as Alias;\n";
+        let tree = parser.parse(source, None).expect("parse source");
+        let file_node = FileNode {
+            id: FileId(1),
+            path: PathBuf::from("repo.rs"),
+            language: LanguageKind::Rust,
+        };
+
+        let symbols = rs_extract_imports(&tree, source, &file_node, "crate::repo::sub");
+        assert_eq!(symbols.len(), 1);
+
+        let symbol = &symbols[0];
+        assert_eq!(symbol.name, "Alias");
+        assert_eq!(symbol.module_path.as_deref(), Some("crate::repo::sub"));
+        assert_eq!(symbol.qualified_name, "crate::repo::sub::Alias");
+
+        match &symbol.info {
+            SymbolInfo::Import(import) => {
+                assert_eq!(
+                    import.resolved_path.as_deref(),
+                    Some("crate::repo::sub::inner::Thing")
+                );
+            }
+            _ => panic!("expected import symbol"),
+        }
     }
 }

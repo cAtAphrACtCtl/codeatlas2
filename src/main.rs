@@ -1,6 +1,7 @@
 mod query;
 mod repo;
 mod search;
+mod extraction;
 
 use std::time::Instant;
 use crate::repo::repo::{repo_commands, repo_handle_commands};
@@ -23,6 +24,6 @@ fn main() {
         _ => unreachable!("unknown subcommand"),
     }
 
-    let elpased = Instant::now() - now;
-    println!("finished with duration = {:?}", elpased);
+    let elapsed = Instant::now() - now;
+    println!("finished with duration = {:?}", elapsed);
 }

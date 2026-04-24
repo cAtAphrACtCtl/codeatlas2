@@ -103,6 +103,7 @@ impl Repo {
         let language = &tree_sitter_rust::LANGUAGE.into();
         for file in &self.files {
             let file_path = self.resolve_file_path(&file.path);
+            let module_path = module_path_for_file(&file.path);
 
             let source = match fs::read_to_string(&file_path) {
                 Ok(s) => s,
@@ -127,36 +128,23 @@ impl Repo {
                     &tree,
                     &source,
                     |node: &Node| {
-                        let text = match node.utf8_text(source_bytes) {
-                            Ok(text) => text,
-                            Err(_) => {
-                                eprintln!(
-                                    "Unable to read import text from source file: {}",
-                                    file_path.display()
-                                );
-                                return None;
-                            }
-                        };
-                        let pos = node.start_position();
-                        let import = ImportInfo {
-                            import_path: String::from(text),
-                            alias: None,
-                            is_glob: false,
-                        };
-
-                        Some(SymbolNode {
-                            id: get_id(),
-                            file: file.id,
-                            name: String::from(text),
-                            module_path: None,
-                            info: SymbolInfo::Import(import),
-                            span: Span {
-                                start_line: pos.row + 1,
-                                start_col: pos.column + 1,
-                                end_line: 0,
-                                end_col: 0,
-                            },
-                        })
+                        extract_import_info(node, source_bytes)
+                            .into_iter()
+                            .map(|import| {
+                                let name = import
+                                    .alias
+                                    .clone()
+                                    .unwrap_or_else(|| import.import_path.clone());
+                                SymbolNode {
+                                    id: get_id(),
+                                    file: file.id,
+                                    name,
+                                    module_path: Some(module_path.clone()),
+                                    info: SymbolInfo::Import(import),
+                                    span: extract_span(node),
+                                }
+                            })
+                            .collect()
                     },
                 )
                 .as_mut(),
@@ -168,7 +156,6 @@ impl Repo {
                     &tree,
                     &source,
                     |node: &Node /* Type */| {
-                        let pos = node.start_position();
                         let args = node.child_by_field_name("parameters").map(|params| {
                             let mut cursor = params.walk();
                             params
@@ -183,19 +170,14 @@ impl Repo {
                             .and_then(|n| n.utf8_text(source_bytes).ok())
                             .unwrap_or("unknown")
                             .to_string();
-                        Some(SymbolNode {
+                        vec![SymbolNode {
                             id: get_id(),
                             file: file.id,
                             name: String::from(&name),
-                            module_path: None,
+                            module_path: Some(module_path.clone()),
                             info: SymbolInfo::Function(FunctionInfo { args }),
-                            span: Span {
-                                start_line: pos.row + 1,
-                                start_col: pos.column + 1,
-                                end_line: pos.row,
-                                end_col: 0,
-                            },
-                        })
+                            span: extract_span(node),
+                        }]
                     },
                 )
                 .as_mut(),
@@ -214,7 +196,7 @@ impl Repo {
         mut builder: F,
     ) -> Vec<SymbolNode>
     where
-        F: FnMut(&Node) -> Option<SymbolNode>,
+        F: FnMut(&Node) -> Vec<SymbolNode>,
     {
         let query = match Query::new(language, query) {
             Ok(q) => q,
@@ -228,9 +210,7 @@ impl Repo {
         let mut symbols = Vec::new();
         while let Some(m) = matches.next() {
             for c in m.captures.iter() {
-                if let Some(symbol) = builder(&c.node) {
-                    symbols.push(symbol);
-                }
+                symbols.extend(builder(&c.node));
             }
         }
 
@@ -251,6 +231,173 @@ impl Repo {
     }
 }
 
+fn extract_span(node: &Node) -> Span {
+    let start = node.start_position();
+    let end = node.end_position();
+    Span {
+        start_line: start.row + 1,
+        start_col: start.column + 1,
+        end_line: end.row + 1,
+        end_col: end.column + 1,
+    }
+}
+
+fn extract_import_info(node: &Node, source: &[u8]) -> Vec<ImportInfo> {
+    let arg = match node
+        .child_by_field_name("argument")
+        .or_else(|| node.named_child(0))
+    {
+        Some(arg) => arg,
+        None => return vec![],
+    };
+
+    let mut result = vec![];
+    collect_imports(&arg, source, "", &mut result);
+    result
+}
+
+fn collect_imports(node: &Node, source: &[u8], prefix: &str, out: &mut Vec<ImportInfo>) {
+    match node.kind() {
+        "identifier" | "scoped_identifier" | "crate" | "self" | "super" => {
+            if let Ok(text) = node.utf8_text(source) {
+                out.push(ImportInfo {
+                    import_path: join_path(prefix, text),
+                    alias: None,
+                    is_glob: false,
+                });
+            }
+        }
+        "use_as_clause" => {
+            let path = node
+                .child_by_field_name("path")
+                .or_else(|| node.named_child(0))
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            let alias = node
+                .child_by_field_name("alias")
+                .or_else(|| node.named_child(1))
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(String::from);
+
+            out.push(ImportInfo {
+                import_path: join_path(prefix, path),
+                alias,
+                is_glob: false,
+            });
+        }
+        "use_wildcard" => {
+            let path = node
+                .child_by_field_name("path")
+                .or_else(|| node.named_child(0))
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            let base = join_path(prefix, path);
+            let import_path = if base.is_empty() {
+                String::from("*")
+            } else {
+                format!("{}::*", base)
+            };
+
+            out.push(ImportInfo {
+                import_path,
+                alias: None,
+                is_glob: true,
+            });
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_imports(&child, source, prefix, out);
+            }
+        }
+        "scoped_use_list" => {
+            let path = node
+                .child_by_field_name("path")
+                .or_else(|| node.named_child(0))
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            let scoped_prefix = join_path(prefix, path);
+
+            if let Some(list_node) = node
+                .child_by_field_name("list")
+                .or_else(|| find_named_child(node, "use_list"))
+            {
+                let mut cursor = list_node.walk();
+                for child in list_node.named_children(&mut cursor) {
+                    collect_imports(&child, source, &scoped_prefix, out);
+                }
+            }
+        }
+        "metavariable" => {
+            if let Ok(text) = node.utf8_text(source) {
+                out.push(ImportInfo {
+                    import_path: join_path(prefix, text),
+                    alias: None,
+                    is_glob: false,
+                });
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            if children.is_empty() {
+                if let Ok(text) = node.utf8_text(source) {
+                    out.push(ImportInfo {
+                        import_path: join_path(prefix, text),
+                        alias: None,
+                        is_glob: false,
+                    });
+                }
+            } else {
+                for child in children {
+                    collect_imports(&child, source, prefix, out);
+                }
+            }
+        }
+    }
+}
+
+fn find_named_child<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn join_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        path.to_string()
+    } else if path.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{}::{}", prefix, path)
+    }
+}
+
+fn module_path_for_file(path: &Path) -> String {
+    let mut parts = path
+        .with_extension("")
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+    if parts.first().map(String::as_str) == Some("src") {
+        parts.remove(0);
+    }
+
+    if let Some(last) = parts.last() {
+        if last == "mod" || last == "lib" || last == "main" {
+            parts.pop();
+        }
+    }
+
+    if parts.is_empty() {
+        String::from("crate")
+    } else {
+        format!("crate::{}", parts.join("::"))
+    }
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 enum SymbolInfo {
     Function(FunctionInfo),
@@ -267,7 +414,7 @@ pub(crate) struct FunctionInfo {
 pub(crate) struct StructInfo {
     members: Vec<String>,
 }
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ImportInfo {
     import_path: String,
     alias: Option<String>,
@@ -494,6 +641,21 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
     }
 
+    fn parse_use_imports(source: &str) -> Vec<ImportInfo> {
+        let mut parser = get_parser();
+        let tree = parser.parse(source, None).expect("parse source");
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"(use_declaration) @import"#,
+        )
+        .expect("parse query");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let first = matches.next().expect("first use declaration");
+        let node = first.captures[0].node;
+        extract_import_info(&node, source.as_bytes())
+    }
+
     #[test]
     fn test_repo_add() {
         let expected = AddQuery {
@@ -621,5 +783,64 @@ mod tests {
         assert_eq!(thread_count, ids.len());
         assert_eq!(thread_count, unique_ids.len());
         assert!(ids.into_iter().all(|id| id > RepoId(0)));
+    }
+
+    #[test]
+    fn test_extract_import_info_identifier() {
+        let imports = parse_use_imports("use std::fs;\n");
+        assert_eq!(
+            imports,
+            vec![ImportInfo {
+                import_path: String::from("std::fs"),
+                alias: None,
+                is_glob: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_import_info_use_as_clause() {
+        let imports = parse_use_imports("use std::fs as file_system;\n");
+        assert_eq!(
+            imports,
+            vec![ImportInfo {
+                import_path: String::from("std::fs"),
+                alias: Some(String::from("file_system")),
+                is_glob: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_import_info_use_wildcard() {
+        let imports = parse_use_imports("use std::io::*;\n");
+        assert_eq!(
+            imports,
+            vec![ImportInfo {
+                import_path: String::from("std::io::*"),
+                alias: None,
+                is_glob: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_import_info_scoped_use_list() {
+        let imports = parse_use_imports("use std::io::{BufWriter, Write};\n");
+        assert_eq!(
+            imports,
+            vec![
+                ImportInfo {
+                    import_path: String::from("std::io::BufWriter"),
+                    alias: None,
+                    is_glob: false,
+                },
+                ImportInfo {
+                    import_path: String::from("std::io::Write"),
+                    alias: None,
+                    is_glob: false,
+                }
+            ]
+        );
     }
 }

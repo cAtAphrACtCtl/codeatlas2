@@ -1,7 +1,7 @@
 use std::path::Path;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::repo::repo::{get_id, FileNode, FunctionInfo, ImportInfo, Span, SymbolNode};
+use crate::repo::repo::{get_id, FileNode, FunctionInfo, ImportInfo, Span, StructInfo, SymbolInfo, SymbolNode};
 
 pub(crate) fn extract_span(node: &Node) -> Span {
     let start = node.start_position();
@@ -371,6 +371,41 @@ pub(crate) fn rs_extract_functions(
                 span: extract_span(node),
             }]
         },
+    )
+}
+
+pub(crate) fn rs_extract_structs(
+    tree: &Tree,
+    source: &str,
+    file_node: &FileNode,
+    module_path: &str,
+) -> Vec<SymbolNode> {
+    let file_module_path = canonical_module_path(module_path);
+    let source_bytes = source.as_bytes();
+    query_symbols(
+        r#"(struct_item) @struct"#,
+        tree,
+        source,
+        |node: &Node| {
+            let effective_module = module_path_for_node(node, source_bytes, &file_module_path);
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source_bytes).ok())
+                .unwrap_or("unknown")
+            .to_string();
+            
+            vec![SymbolNode{
+                id:get_id(),
+                file:file_node.id,
+                name:name.clone(),
+                qualified_name:make_qualified_name(&effective_module, &name),
+                module_path:Some(effective_module),
+                info: SymbolInfo::Struct(StructInfo{
+                    members:vec![],
+                },
+                ),
+                span: extract_span(node),
+            }]
+        }
     )
 }
 

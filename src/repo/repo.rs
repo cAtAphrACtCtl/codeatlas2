@@ -1,11 +1,11 @@
-use crate::extraction::rs::extraction::{extract_import_info, extract_span, module_path_for_file, rs_extract_functions, rs_extract_imports};
+use crate::extraction::rs::extraction::{module_path_for_file, rs_extract_functions, rs_extract_imports, rs_extract_structs};
 use clap::{Arg, ArgMatches, Command};
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Parser};
 use walkdir::WalkDir;
 
 static OUTPUT_PATH: &str = "output";
@@ -26,7 +26,7 @@ pub struct SymbolId(u64);
 )]
 pub struct EdgeId(u64);
 
-trait IdType {
+pub(crate) trait  IdType {
     fn from_raw(id: u64) -> Self;
 }
 impl IdType for RepoId {
@@ -113,7 +113,6 @@ impl Repo {
                 }
             };
 
-            let source_bytes = source.as_bytes();
             let tree = match parser.parse(&source, None) {
                 Some(tree) => tree,
                 None => {
@@ -123,6 +122,7 @@ impl Repo {
             };
             symbols.append(rs_extract_imports(&tree, &source, &file, &module_path).as_mut());
             symbols.append(rs_extract_functions(&tree, &source, &file, &module_path).as_mut());
+            symbols.append(rs_extract_structs(&tree, &source, &file, &module_path).as_mut());
         }
 
         symbols
@@ -156,7 +156,7 @@ pub(crate) struct FunctionInfo {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StructInfo {
-    members: Vec<String>,
+    pub(crate) members: Vec<String>,
 }
 #[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ImportInfo {
@@ -382,6 +382,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use tree_sitter::{Query, QueryCursor, StreamingIterator};
+    use crate::extraction::rs::extraction::extract_import_info;
 
     fn fixture_path(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)

@@ -6,3 +6,9 @@ Instead of searching text, you query symbols, relationships, and dependencies.
 - get_symbol
 - list_function
 - calls
+
+
+## Todos
+- extract structs
+- build edge for Repo to File and File to Symbol
+- impl query function to be called

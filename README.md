@@ -9,6 +9,5 @@ Instead of searching text, you query symbols, relationships, and dependencies.
 
 
 ## Todos
-- extract structs
 - build edge for Repo to File and File to Symbol
 - impl query function to be called

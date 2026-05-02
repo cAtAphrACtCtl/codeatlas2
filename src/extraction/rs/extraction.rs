@@ -194,6 +194,45 @@ fn make_qualified_name(module_path: &str, name: &str) -> String {
     }
 }
 
+fn extract_struct_members(node: &Node, source: &[u8]) -> Vec<String> {
+    let Some(body) = node
+        .child_by_field_name("body")
+        .or_else(|| find_named_child(node, "field_declaration_list"))
+        .or_else(|| find_named_child(node, "ordered_field_declaration_list"))
+    else {
+        return vec![];
+    };
+
+    if body.kind() == "ordered_field_declaration_list" {
+        let mut cursor = body.walk();
+        return body
+            .named_children(&mut cursor)
+            .filter(|child| !matches!(child.kind(), "attribute_item" | "visibility_modifier"))
+            .filter_map(|child| child.utf8_text(source).ok())
+            .map(String::from)
+            .collect();
+    }
+
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter_map(|child| extract_struct_member(&child, source))
+        .collect()
+}
+
+fn extract_struct_member(node: &Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+
+    node.child_by_field_name("name")
+        .and_then(|name| name.utf8_text(source).ok())
+        .or_else(|| {
+            node.child_by_field_name("type")
+                .and_then(|field_type| field_type.utf8_text(source).ok())
+        })
+        .map(String::from)
+}
+
 fn resolve_import_path(current_module: &str, raw_import_path: &str) -> String {
     if raw_import_path.starts_with("crate::") {
         return raw_import_path.to_string();
@@ -388,24 +427,23 @@ pub(crate) fn rs_extract_structs(
         source,
         |node: &Node| {
             let effective_module = module_path_for_node(node, source_bytes, &file_module_path);
-            let name = node.child_by_field_name("name")
+            let name = node
+                .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source_bytes).ok())
                 .unwrap_or("unknown")
-            .to_string();
-            
-            vec![SymbolNode{
-                id:get_id(),
-                file:file_node.id,
-                name:name.clone(),
-                qualified_name:make_qualified_name(&effective_module, &name),
-                module_path:Some(effective_module),
-                info: SymbolInfo::Struct(StructInfo{
-                    members:vec![],
-                },
-                ),
+                .to_string();
+            let members = extract_struct_members(node, source_bytes);
+
+            vec![SymbolNode {
+                id: get_id(),
+                file: file_node.id,
+                name: name.clone(),
+                qualified_name: make_qualified_name(&effective_module, &name),
+                module_path: Some(effective_module),
+                info: SymbolInfo::Struct(StructInfo { members }),
                 span: extract_span(node),
             }]
-        }
+        },
     )
 }
 
@@ -551,6 +589,92 @@ use std::fs;
             fs_sym.module_path.as_deref(),
             Some("crate::repo::repo")
         );
+    }
+
+    #[test]
+    fn test_rs_extract_structs_collects_members_and_nested_mod_paths() {
+        let source = r#"
+pub struct Config {
+    enabled: bool,
+    pub count: usize,
+}
+
+mod inner {
+    struct State {
+        name: String,
+        active: bool,
+    }
+}
+
+struct Unit;
+"#;
+        let tree = get_rust_parser().parse(source, None).expect("parse");
+        let file_node = make_file_node();
+
+        let symbols = rs_extract_structs(&tree, source, &file_node, "crate::repo::repo");
+
+        let by_name = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("symbol '{}' not found", name))
+        };
+
+        let config = by_name("Config");
+        assert_eq!(config.module_path.as_deref(), Some("crate::repo::repo"));
+        assert_eq!(config.qualified_name, "crate::repo::repo::Config");
+        assert!(matches!(
+            &config.info,
+            SymbolInfo::Struct(StructInfo { members }) if members == &vec![String::from("enabled"), String::from("count")]
+        ));
+
+        let state = by_name("State");
+        assert_eq!(
+            state.module_path.as_deref(),
+            Some("crate::repo::repo::inner")
+        );
+        assert_eq!(state.qualified_name, "crate::repo::repo::inner::State");
+        assert!(matches!(
+            &state.info,
+            SymbolInfo::Struct(StructInfo { members }) if members == &vec![String::from("name"), String::from("active")]
+        ));
+
+        let unit = by_name("Unit");
+        assert!(matches!(
+            &unit.info,
+            SymbolInfo::Struct(StructInfo { members }) if members.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_rs_extract_structs_collects_tuple_struct_field_types() {
+        let source = r#"
+pub struct EdgeId(u64);
+struct Pair(pub String, bool);
+"#;
+        let tree = get_rust_parser().parse(source, None).expect("parse");
+        let file_node = make_file_node();
+
+        let symbols = rs_extract_structs(&tree, source, &file_node, "crate::repo::repo");
+
+        let by_name = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("symbol '{}' not found", name))
+        };
+
+        let edge_id = by_name("EdgeId");
+        assert!(matches!(
+            &edge_id.info,
+            SymbolInfo::Struct(StructInfo { members }) if members == &vec![String::from("u64")]
+        ));
+
+        let pair = by_name("Pair");
+        assert!(matches!(
+            &pair.info,
+            SymbolInfo::Struct(StructInfo { members }) if members == &vec![String::from("String"), String::from("bool")]
+        ));
     }
 }
 

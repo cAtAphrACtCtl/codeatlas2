@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tree_sitter::{Parser};
 use walkdir::WalkDir;
 
-static OUTPUT_PATH: &str = "output";
+pub(crate) static OUTPUT_PATH: &str = "output";
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd,
 )]
@@ -128,6 +128,65 @@ impl Repo {
         symbols
     }
 
+    fn build_edges(&self) -> Vec<Edge> {
+        let mut edges = self
+            .files
+            .iter()
+            .map(|file| Edge {
+                id: get_id(),
+                kind: EdgeKind::Contain,
+                from: NodeRef::Repo(self.id),
+                to: NodeRef::File(file.id),
+            })
+            .collect::<Vec<_>>();
+
+        edges.extend(self.symbols.iter().map(|symbol| Edge {
+            id: get_id(),
+            kind: EdgeKind::Contain,
+            from: NodeRef::File(symbol.file),
+            to: NodeRef::Symbol(symbol.id),
+        }));
+
+        edges
+    }
+
+    fn resolve_symbol_file_id(&self, symbol_id: SymbolId) -> Option<FileId> {
+        self.edges.iter().find_map(|edge| match (&edge.kind, &edge.from, &edge.to) {
+            (EdgeKind::Contain, NodeRef::File(file_id), NodeRef::Symbol(candidate_symbol_id))
+                if *candidate_symbol_id == symbol_id => Some(*file_id),
+            _ => None,
+        })
+    }
+
+    fn is_repo_file(&self, file_id: FileId) -> bool {
+        self.edges.iter().any(|edge| {
+            matches!(
+                (&edge.kind, &edge.from, &edge.to),
+                (EdgeKind::Contain, NodeRef::Repo(repo_id), NodeRef::File(candidate_file_id))
+                    if *repo_id == self.id && *candidate_file_id == file_id
+            )
+        })
+    }
+
+    pub(crate) fn resolve_symbol_file_path(&self, symbol_id: SymbolId) -> Option<PathBuf> {
+        let file_id = self.resolve_symbol_file_id(symbol_id)?;
+        if !self.is_repo_file(file_id) {
+            return None;
+        }
+
+        let file = self.files.iter().find(|file| file.id == file_id)?;
+        Some(self.resolve_file_path(&file.path))
+    }
+
+    pub(crate) fn find_symbols(&self, query: &str) -> Vec<SymbolNode> {
+        self.symbols
+            .iter()
+            .filter(|symbol| symbol.name == query || symbol.qualified_name == query)
+            .filter(|symbol| self.resolve_symbol_file_path(symbol.id).is_some())
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn export_json(&self, output_file: &Path) -> std::io::Result<()> {
         if let Some(parent) = output_file.parent() {
             fs::create_dir_all(parent)?
@@ -142,19 +201,19 @@ impl Repo {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) enum SymbolInfo {
     Function(FunctionInfo),
     Struct(StructInfo),
     Import(ImportInfo),
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct FunctionInfo {
     pub(crate) args: Option<Vec<String>>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct StructInfo {
     pub(crate) members: Vec<String>,
 }
@@ -166,7 +225,7 @@ pub(crate) struct ImportInfo {
     pub(crate) resolved_path: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SymbolNode {
     pub(crate) id: SymbolId,
     pub(crate) file: FileId,
@@ -176,7 +235,7 @@ pub(crate) struct SymbolNode {
     pub(crate) info: SymbolInfo,
     pub(crate) span: Span,
 }
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Span {
     pub(crate) start_line: usize,
     pub(crate) start_col: usize,
@@ -246,6 +305,7 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
                 }
             };
             repo.symbols = repo.extract_symbols();
+            repo.edges = repo.build_edges();
 
             let output_file = Path::join(OUTPUT_PATH.as_ref(), repo.name.as_str());
             match repo.export_json(output_file.as_path()) {
@@ -493,6 +553,118 @@ mod tests {
         let symbols = repo.extract_symbols();
 
         assert!(!symbols.is_empty());
+    }
+
+    #[test]
+    fn test_build_edges_links_repo_files_and_symbols() {
+        let file_id = FileId(11);
+        let symbol_id = SymbolId(21);
+        let mut repo = Repo::new(
+            String::from("repo"),
+            PathBuf::from("path"),
+            vec![FileNode {
+                id: file_id,
+                path: PathBuf::from("repo.rs"),
+                language: LanguageKind::Rust,
+            }],
+        );
+        repo.symbols = vec![SymbolNode {
+            id: symbol_id,
+            file: file_id,
+            name: String::from("EdgeId"),
+            qualified_name: String::from("crate::repo::EdgeId"),
+            module_path: Some(String::from("crate::repo")),
+            info: SymbolInfo::Struct(StructInfo {
+                members: vec![String::from("u64")],
+            }),
+            span: Span {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 19,
+            },
+        }];
+
+        let edges = repo.build_edges();
+
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            matches!(
+                (&edge.kind, &edge.from, &edge.to),
+                (EdgeKind::Contain, NodeRef::Repo(repo_id), NodeRef::File(id))
+                    if *repo_id == repo.id && *id == file_id
+            )
+        }));
+        assert!(edges.iter().any(|edge| {
+            matches!(
+                (&edge.kind, &edge.from, &edge.to),
+                (EdgeKind::Contain, NodeRef::File(id), NodeRef::Symbol(symbol))
+                    if *id == file_id && *symbol == symbol_id
+            )
+        }));
+    }
+
+    #[test]
+    fn test_find_symbols_uses_edges_to_resolve_file_and_kind() {
+        let file_id = FileId(11);
+        let symbol_id = SymbolId(21);
+        let mut repo = Repo::new(
+            String::from("repo"),
+            PathBuf::from("path"),
+            vec![FileNode {
+                id: file_id,
+                path: PathBuf::from("src").join("repo.rs"),
+                language: LanguageKind::Rust,
+            }],
+        );
+        repo.symbols = vec![SymbolNode {
+            id: symbol_id,
+            file: FileId(999),
+            name: String::from("EdgeId"),
+            qualified_name: String::from("crate::repo::EdgeId"),
+            module_path: Some(String::from("crate::repo")),
+            info: SymbolInfo::Struct(StructInfo {
+                members: vec![String::from("u64")],
+            }),
+            span: Span {
+                start_line: 27,
+                start_col: 1,
+                end_line: 27,
+                end_col: 24,
+            },
+        }];
+        repo.edges = vec![
+            Edge {
+                id: EdgeId(31),
+                kind: EdgeKind::Contain,
+                from: NodeRef::Repo(repo.id),
+                to: NodeRef::File(file_id),
+            },
+            Edge {
+                id: EdgeId(32),
+                kind: EdgeKind::Contain,
+                from: NodeRef::File(file_id),
+                to: NodeRef::Symbol(symbol_id),
+            },
+        ];
+
+        let matches = repo.find_symbols("EdgeId");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "EdgeId");
+        assert_eq!(matches[0].qualified_name, "crate::repo::EdgeId");
+        assert_eq!(matches[0].module_path.as_deref(), Some("crate::repo"));
+        assert_eq!(
+            repo.resolve_symbol_file_path(matches[0].id),
+            Some(PathBuf::from("path").join("src").join("repo.rs"))
+        );
+
+        match &matches[0].info {
+            SymbolInfo::Struct(info) => {
+                assert_eq!(info.members, vec![String::from("u64")]);
+            }
+            _ => panic!("expected struct symbol"),
+        }
     }
 
     #[test]

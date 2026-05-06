@@ -1,4 +1,4 @@
-use crate::repo::repo::{Repo, SymbolNode, OUTPUT_PATH};
+use crate::repo::repo::{OUTPUT_PATH, Repo, Span, SymbolInfo, SymbolNode};
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use std::fs::{self, File};
 use std::io;
@@ -54,20 +54,53 @@ fn find_parse_command(matches: &ArgMatches) -> FindQuery {
     }
 }
 
-#[derive(Debug)]
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum FindScope {
     Dir(String),
     Repo(String),
     All,
 }
 
-#[derive(Debug)]
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FindQuery {
     symbol: String,
     scope: FindScope,
     list_mode: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SymbolSearchResult {
+    name: String,
+    qualified_name: String,
+    kind: &'static str,
+    path: String,
+    module_path: Option<String>,
+    span: Span,
+    info: SymbolInfo,
+}
+
+impl SymbolSearchResult {
+    fn new(path: PathBuf, symbol: SymbolNode) -> Self {
+        let kind = symbol_kind(&symbol.info);
+
+        SymbolSearchResult {
+            name: symbol.name,
+            qualified_name: symbol.qualified_name,
+            kind,
+            path: path.to_string_lossy().into_owned(),
+            module_path: symbol.module_path,
+            span: symbol.span,
+            info: symbol.info,
+        }
+    }
+}
+
+fn symbol_kind(info: &SymbolInfo) -> &'static str {
+    match info {
+        SymbolInfo::Function(_) => "function",
+        SymbolInfo::Struct(_) => "struct",
+        SymbolInfo::Import(_) => "import",
+    }
 }
 
 pub fn find(query: FindQuery) -> io::Result<String> {
@@ -82,7 +115,9 @@ pub fn find(query: FindQuery) -> io::Result<String> {
 
 fn load_repos(scope: &FindScope) -> io::Result<Vec<Repo>> {
     match scope {
-        FindScope::Repo(repo_name) => load_repo(Path::new(OUTPUT_PATH).join(repo_name)).map(|repo| vec![repo]),
+        FindScope::Repo(repo_name) => {
+            load_repo(Path::new(OUTPUT_PATH).join(repo_name)).map(|repo| vec![repo])
+        }
         FindScope::Dir(_) | FindScope::All => load_all_repos(),
     }
 }
@@ -145,20 +180,23 @@ fn find_in_repos(query: &FindQuery, repos: &[Repo], dir_scope: Option<&Path>) ->
     let _ = query.list_mode;
     let symbols = matches
         .into_iter()
-        .map(|(_, symbol)| symbol)
+        .map(|(path, symbol)| SymbolSearchResult::new(path, symbol))
         .collect::<Vec<_>>();
 
     render_matches(&symbols)
 }
 
-fn render_matches(matches: &[SymbolNode]) -> String {
+fn render_matches(matches: &[SymbolSearchResult]) -> String {
     serde_json::to_string_pretty(matches).expect("serialize symbol matches")
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use crate::repo::repo::Repo;
-    use crate::search::find::{find_commands, find_in_repos, find_parse_command, FindQuery, FindScope};
+    use crate::search::find::{
+        FindQuery, FindScope, find_commands, find_in_repos, find_parse_command,
+    };
+    use std::path::Path;
 
     fn parse(args: Vec<&str>) -> FindQuery {
         let matches = find_commands()
@@ -169,70 +207,72 @@ mod tests{
     }
 
     fn sample_repo() -> Repo {
-        serde_json::from_str(
-            r#"{
-                "id": 1,
-                "name": "codeatlas",
-                "root_path": "repo-root",
-                "files": [
-                    {
-                        "id": 2,
-                        "path": "src/repo.rs",
-                        "language": "Rust"
-                    }
-                ],
-                "symbols": [
-                    {
-                        "id": 3,
-                        "file": 999,
-                        "name": "EdgeId",
-                        "qualified_name": "crate::repo::EdgeId",
-                        "module_path": "crate::repo",
-                        "info": {
-                            "Struct": {
-                                "members": ["u64"]
-                            }
-                        },
-                        "span": {
-                            "start_line": 27,
-                            "start_col": 1,
-                            "end_line": 27,
-                            "end_col": 24
-                        }
-                    }
-                ],
-                "edges": [
-                    {
-                        "id": 4,
-                        "kind": "Contain",
-                        "from": {
-                            "Repo": 1
-                        },
-                        "to": {
-                            "File": 2
+        let root_path = std::env::current_dir()
+            .expect("current directory")
+            .join("repo-root");
+
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "name": "codeatlas",
+            "root_path": root_path,
+            "files": [
+                {
+                    "id": 2,
+                    "path": "src/repo.rs",
+                    "language": "Rust"
+                }
+            ],
+            "symbols": [
+                {
+                    "id": 3,
+                    "file": 999,
+                    "name": "EdgeId",
+                    "qualified_name": "crate::repo::EdgeId",
+                    "module_path": "crate::repo",
+                    "info": {
+                        "Struct": {
+                            "members": ["u64"]
                         }
                     },
-                    {
-                        "id": 5,
-                        "kind": "Contain",
-                        "from": {
-                            "File": 2
-                        },
-                        "to": {
-                            "Symbol": 3
-                        }
+                    "span": {
+                        "start_line": 27,
+                        "start_col": 1,
+                        "end_line": 27,
+                        "end_col": 24
                     }
-                ]
-            }"#,
-        )
+                }
+            ],
+            "edges": [
+                {
+                    "id": 4,
+                    "kind": "Contain",
+                    "from": {
+                        "Repo": 1
+                    },
+                    "to": {
+                        "File": 2
+                    }
+                },
+                {
+                    "id": 5,
+                    "kind": "Contain",
+                    "from": {
+                        "File": 2
+                    },
+                    "to": {
+                        "Symbol": 3
+                    }
+                }
+            ]
+        }))
         .expect("parse sample repo")
     }
 
     #[test]
-    fn test_find_parse_symbol_only(){
+    fn test_find_parse_symbol_only() {
         let expected_query = FindQuery {
-            symbol:String::from("a"),
-            scope:FindScope::All,
+            symbol: String::from("a"),
+            scope: FindScope::All,
             list_mode: false,
         };
 
@@ -241,10 +281,10 @@ mod tests{
     }
 
     #[test]
-    fn test_find_parse_symbol_and_dir(){
+    fn test_find_parse_symbol_and_dir() {
         let expected_query = FindQuery {
-            symbol:String::from("a"),
-            scope:FindScope::Dir(String::from("path")),
+            symbol: String::from("a"),
+            scope: FindScope::Dir(String::from("path")),
             list_mode: false,
         };
 
@@ -253,10 +293,10 @@ mod tests{
     }
 
     #[test]
-    fn test_find_parse_symbol_with_dir_and_list(){
+    fn test_find_parse_symbol_with_dir_and_list() {
         let expected_query = FindQuery {
-            symbol:String::from("a"),
-            scope:FindScope::Repo(String::from("repo")),
+            symbol: String::from("a"),
+            scope: FindScope::Repo(String::from("repo")),
             list_mode: true,
         };
 
@@ -276,13 +316,26 @@ mod tests{
             None,
         );
 
-        let symbols = serde_json::from_str::<Vec<serde_json::Value>>(&output)
-            .expect("parse symbol json");
+        let symbols =
+            serde_json::from_str::<Vec<serde_json::Value>>(&output).expect("parse symbol json");
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "EdgeId");
         assert_eq!(symbols[0]["qualified_name"], "crate::repo::EdgeId");
+        assert_eq!(symbols[0]["kind"], "struct");
         assert_eq!(symbols[0]["module_path"], "crate::repo");
+        assert_eq!(symbols[0]["span"]["start_line"], 27);
+        let path = symbols[0]["path"]
+            .as_str()
+            .expect("path should be a string");
+        assert!(
+            Path::new(path).is_absolute(),
+            "expected path to be absolute, got {path}"
+        );
+        assert!(
+            path.replace('\\', "/").ends_with("repo-root/src/repo.rs"),
+            "expected path to end with repo-root/src/repo.rs, got {path}"
+        );
         assert_eq!(symbols[0]["info"]["Struct"]["members"][0], "u64");
     }
 
@@ -298,8 +351,8 @@ mod tests{
             None,
         );
 
-        let symbols = serde_json::from_str::<Vec<serde_json::Value>>(&output)
-            .expect("parse symbol json");
+        let symbols =
+            serde_json::from_str::<Vec<serde_json::Value>>(&output).expect("parse symbol json");
 
         assert_eq!(symbols[0]["info"]["Struct"]["members"][0], "u64");
     }

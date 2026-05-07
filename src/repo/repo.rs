@@ -1,6 +1,8 @@
+use crate::config::app_config::{AppConfig, AppConfigError};
 use crate::extraction::rs::extraction::{
     module_path_for_file, rs_extract_functions, rs_extract_imports, rs_extract_structs,
 };
+use crate::repo::ignore_filter::RepoScanFilter;
 use clap::{Arg, ArgMatches, Command};
 use std::fs;
 use std::fs::File;
@@ -308,7 +310,7 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
                 Ok(repo) => repo,
                 Err(e) => {
                     eprintln!("Failed to add repo {}", e);
-                    return;
+                    std::process::exit(1);
                 }
             };
             repo.symbols = repo.extract_symbols();
@@ -330,9 +332,47 @@ pub fn repo_handle_commands(matches: &ArgMatches) {
     }
 }
 
-fn repo_add(mut query: AddQuery) -> std::io::Result<Repo> {
+#[derive(Debug)]
+enum RepoAddError {
+    Io(std::io::Error),
+    AppConfig(AppConfigError),
+}
+
+impl std::fmt::Display for RepoAddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RepoAddError::Io(error) => write!(f, "{}", error),
+            RepoAddError::AppConfig(error) => write!(f, "{}", error),
+        }
+    }
+}
+
+impl From<std::io::Error> for RepoAddError {
+    fn from(error: std::io::Error) -> Self {
+        RepoAddError::Io(error)
+    }
+}
+
+impl From<AppConfigError> for RepoAddError {
+    fn from(error: AppConfigError) -> Self {
+        RepoAddError::AppConfig(error)
+    }
+}
+
+fn repo_add(mut query: AddQuery) -> Result<Repo, RepoAddError> {
     query.path = query.path.canonicalize()?;
-    let files = relativize_files(query.path.as_path(), walk_dir(query.path.as_path()));
+
+    let app_config = AppConfig::load_or_create()?;
+    let repo_filter = if query.path.is_file() {
+        None
+    } else {
+        RepoScanFilter::load(query.path.as_path(), &app_config.repo_scan.ignore_filter)
+    };
+
+    let files = relativize_files(
+        query.path.as_path(),
+        walk_dir(query.path.as_path(), repo_filter.as_ref()),
+    );
     let files = files
         .into_iter()
         .map(|f| FileNode {
@@ -348,29 +388,51 @@ fn repo_delete(_query: DeleteQuery) -> bool {
     false
 }
 
-fn walk_dir(path: &Path) -> Vec<PathBuf> {
+fn walk_dir(path: &Path, repo_filter: Option<&RepoScanFilter>) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if path.is_file() {
         files.push(PathBuf::from(path));
-    } else {
-        for entry in WalkDir::new(path) {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(rs_file) = path.extension()
-                        && rs_file == "rs"
-                    {
-                        files.push(entry.path().to_path_buf());
-                    }
-                } else if path.is_dir() {
+        return files;
+    }
+
+    let mut entries = WalkDir::new(path).into_iter();
+    while let Some(entry) = entries.next() {
+        match entry {
+            Ok(entry) => {
+                let entry_path = entry.path();
+                if entry_path == path {
                     continue;
                 }
-            } else {
-                eprintln!("unable to read {:?}", path);
+
+                let relative_path = entry_path.strip_prefix(path).unwrap_or(entry_path);
+                if entry.file_type().is_dir() {
+                    if repo_filter.is_some_and(|filter| filter.is_ignored(relative_path, true)) {
+                        entries.skip_current_dir();
+                    }
+                    continue;
+                }
+
+                if !is_rust_file(entry_path) {
+                    continue;
+                }
+
+                if repo_filter.is_some_and(|filter| filter.is_ignored(relative_path, false)) {
+                    continue;
+                }
+
+                files.push(entry_path.to_path_buf());
+            }
+            Err(error) => {
+                eprintln!("unable to read {}", error);
             }
         }
     }
+
     files
+}
+
+fn is_rust_file(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rs")
 }
 
 fn repo_root(path: &Path) -> &Path {
@@ -447,9 +509,12 @@ impl CommandQuery for DeleteQuery {
 mod tests {
     use super::*;
     use crate::extraction::rs::extraction::extract_import_info;
+    use crate::test_support::{CurrentDirGuard, env_lock};
     use std::collections::HashSet;
+    use std::fs;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tree_sitter::{Query, QueryCursor, StreamingIterator};
 
     fn fixture_path(relative: &str) -> PathBuf {
@@ -469,6 +534,21 @@ mod tests {
         let first = matches.next().expect("first use declaration");
         let node = first.captures[0].node;
         extract_import_info(&node, source.as_bytes())
+    }
+
+    fn create_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "codeatlas2-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     #[test]
@@ -501,6 +581,9 @@ mod tests {
 
     #[test]
     fn test_repo_add_stores_directory_files_as_relative_paths() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-dir-relative");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
         let repo_path = fixture_path("unittest/repos/dir_case");
 
         let repo = repo_add(AddQuery {
@@ -528,6 +611,9 @@ mod tests {
 
     #[test]
     fn test_repo_add_stores_single_file_as_relative_path() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-single-relative");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
         let repo_path = fixture_path("unittest/repos/single_file/standalone.rs");
 
         let repo = repo_add(AddQuery {
@@ -823,5 +909,235 @@ mod tests {
             }
             _ => panic!("expected import symbol"),
         }
+    }
+
+    #[test]
+    fn test_repo_add_filters_files_using_repo_gitignore() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-filter");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(repo_path.join("src").join("generated")).expect("create generated dir");
+        fs::write(repo_path.join("src").join("lib.rs"), "pub fn keep() {}\n")
+            .expect("write lib.rs");
+        fs::write(
+            repo_path.join("src").join("generated").join("ignored.rs"),
+            "pub fn ignored() {}\n",
+        )
+        .expect("write ignored.rs");
+        fs::write(repo_path.join(".gitignore"), "src/generated/\n").expect("write gitignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path.clone(),
+        })
+        .expect("repo add");
+
+        let files = repo
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(vec![PathBuf::from("src").join("lib.rs")], files);
+    }
+
+    #[test]
+    fn test_repo_add_single_file_ignores_repo_gitignore_filter() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-single-file");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(&repo_path).expect("create repo dir");
+        let single_file = repo_path.join("standalone.rs");
+        fs::write(&single_file, "pub fn keep() {}\n").expect("write standalone.rs");
+        fs::write(repo_path.join(".gitignore"), "standalone.rs\n").expect("write gitignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: single_file.clone(),
+        })
+        .expect("repo add");
+
+        assert_eq!(
+            repo.files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("standalone.rs")]
+        );
+    }
+
+    #[test]
+    fn test_repo_add_uses_gitignore_negation_semantics() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-negation");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(repo_path.join("src").join("generated")).expect("create dirs");
+        fs::write(repo_path.join("src").join("lib.rs"), "pub fn keep() {}\n")
+            .expect("write lib.rs");
+        fs::write(
+            repo_path.join("src").join("generated").join("drop.rs"),
+            "pub fn drop_me() {}\n",
+        )
+        .expect("write drop.rs");
+        fs::write(
+            repo_path.join("src").join("generated").join("keep.rs"),
+            "pub fn keep_me() {}\n",
+        )
+        .expect("write keep.rs");
+        fs::write(
+            repo_path.join(".gitignore"),
+            "src/generated/*.rs\n!src/generated/keep.rs\n",
+        )
+        .expect("write gitignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path,
+        })
+        .expect("repo add");
+
+        let mut files = repo
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("src").join("generated").join("keep.rs"),
+                PathBuf::from("src").join("lib.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_repo_add_respects_root_anchored_gitignore_patterns() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-root-anchor");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src dir");
+        fs::create_dir_all(repo_path.join("nested").join("src")).expect("create nested src dir");
+        fs::write(repo_path.join("src").join("lib.rs"), "pub fn root() {}\n")
+            .expect("write root lib.rs");
+        fs::write(
+            repo_path.join("nested").join("src").join("lib.rs"),
+            "pub fn nested() {}\n",
+        )
+        .expect("write nested lib.rs");
+        fs::write(repo_path.join(".gitignore"), "/src/lib.rs\n").expect("write gitignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path,
+        })
+        .expect("repo add");
+
+        assert_eq!(
+            repo.files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("nested").join("src").join("lib.rs")]
+        );
+    }
+
+    #[test]
+    fn test_repo_add_only_reads_repo_root_gitignore() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-root-only");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(repo_path.join("src").join("nested")).expect("create dirs");
+        fs::write(repo_path.join("src").join("lib.rs"), "pub fn keep() {}\n")
+            .expect("write lib.rs");
+        fs::write(
+            repo_path.join("src").join("nested").join("ignored.rs"),
+            "pub fn still_keep() {}\n",
+        )
+        .expect("write ignored.rs");
+        fs::write(
+            repo_path.join("src").join(".gitignore"),
+            "nested/ignored.rs\n",
+        )
+        .expect("write nested gitignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path,
+        })
+        .expect("repo add");
+
+        let mut files = repo
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("src").join("lib.rs"),
+                PathBuf::from("src").join("nested").join("ignored.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_repo_add_does_not_read_parent_gitignore() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-parent-ignore");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src dir");
+        fs::write(repo_path.join("src").join("lib.rs"), "pub fn keep() {}\n")
+            .expect("write lib.rs");
+        fs::write(temp_dir.join(".gitignore"), "repo/src/lib.rs\n")
+            .expect("write parent gitignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path,
+        })
+        .expect("repo add");
+
+        assert_eq!(
+            repo.files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("src").join("lib.rs")]
+        );
+    }
+
+    #[test]
+    fn test_repo_add_does_not_read_repo_root_dot_ignore() {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp_dir = create_temp_dir("repo-add-dot-ignore");
+        let _guard = CurrentDirGuard::change_to(&temp_dir);
+        let repo_path = temp_dir.join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src dir");
+        fs::write(repo_path.join("src").join("lib.rs"), "pub fn keep() {}\n")
+            .expect("write lib.rs");
+        fs::write(repo_path.join(".ignore"), "src/lib.rs\n").expect("write .ignore");
+
+        let repo = repo_add(AddQuery {
+            repo: String::from("repo"),
+            path: repo_path,
+        })
+        .expect("repo add");
+
+        assert_eq!(
+            repo.files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("src").join("lib.rs")]
+        );
     }
 }

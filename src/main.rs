@@ -1,7 +1,10 @@
+mod config;
 mod extraction;
 mod query;
 mod repo;
 mod search;
+#[cfg(test)]
+mod test_support;
 
 use crate::repo::repo::{repo_commands, repo_handle_commands};
 use crate::search::find::{find_commands, find_handle_command};

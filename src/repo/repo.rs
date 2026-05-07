@@ -1,11 +1,13 @@
-use crate::extraction::rs::extraction::{module_path_for_file, rs_extract_functions, rs_extract_imports, rs_extract_structs};
+use crate::extraction::rs::extraction::{
+    module_path_for_file, rs_extract_functions, rs_extract_imports, rs_extract_structs,
+};
 use clap::{Arg, ArgMatches, Command};
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tree_sitter::{Parser};
+use tree_sitter::Parser;
 use walkdir::WalkDir;
 
 pub(crate) static OUTPUT_PATH: &str = "output";
@@ -26,7 +28,7 @@ pub struct SymbolId(u64);
 )]
 pub struct EdgeId(u64);
 
-pub(crate) trait  IdType {
+pub(crate) trait IdType {
     fn from_raw(id: u64) -> Self;
 }
 impl IdType for RepoId {
@@ -151,11 +153,16 @@ impl Repo {
     }
 
     fn resolve_symbol_file_id(&self, symbol_id: SymbolId) -> Option<FileId> {
-        self.edges.iter().find_map(|edge| match (&edge.kind, &edge.from, &edge.to) {
-            (EdgeKind::Contain, NodeRef::File(file_id), NodeRef::Symbol(candidate_symbol_id))
-                if *candidate_symbol_id == symbol_id => Some(*file_id),
-            _ => None,
-        })
+        self.edges
+            .iter()
+            .find_map(|edge| match (&edge.kind, &edge.from, &edge.to) {
+                (
+                    EdgeKind::Contain,
+                    NodeRef::File(file_id),
+                    NodeRef::Symbol(candidate_symbol_id),
+                ) if *candidate_symbol_id == symbol_id => Some(*file_id),
+                _ => None,
+            })
     }
 
     fn is_repo_file(&self, file_id: FileId) -> bool {
@@ -439,11 +446,11 @@ impl CommandQuery for DeleteQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::rs::extraction::extract_import_info;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tree_sitter::{Query, QueryCursor, StreamingIterator};
-    use crate::extraction::rs::extraction::extract_import_info;
 
     fn fixture_path(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)

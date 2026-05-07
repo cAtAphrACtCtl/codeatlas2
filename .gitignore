@@ -21,6 +21,7 @@ target
 .idea/
 
 .vscode
+.pi
 
 # Added by cargo
 

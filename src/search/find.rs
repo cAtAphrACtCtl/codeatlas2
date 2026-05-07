@@ -10,7 +10,7 @@ pub fn find_commands() -> Command {
         .arg(Arg::new("symbol").help("symbol to query").required(true))
         .arg(
             Arg::new("list")
-                .help("list members")
+                .help("show detailed results")
                 .action(ArgAction::SetTrue)
                 .short('l'),
         )
@@ -69,7 +69,32 @@ pub struct FindQuery {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct SymbolSearchResult {
+struct SummarySymbolSearchResult {
+    kind: &'static str,
+    file_name: String,
+    path: String,
+    span: Span,
+}
+
+impl SummarySymbolSearchResult {
+    fn new(path: PathBuf, symbol: SymbolNode) -> Self {
+        let kind = symbol_kind(&symbol.info);
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+        SummarySymbolSearchResult {
+            kind,
+            file_name,
+            path: path.to_string_lossy().into_owned(),
+            span: symbol.span,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DetailedSymbolSearchResult {
     name: String,
     qualified_name: String,
     kind: &'static str,
@@ -79,11 +104,11 @@ struct SymbolSearchResult {
     info: SymbolInfo,
 }
 
-impl SymbolSearchResult {
+impl DetailedSymbolSearchResult {
     fn new(path: PathBuf, symbol: SymbolNode) -> Self {
         let kind = symbol_kind(&symbol.info);
 
-        SymbolSearchResult {
+        DetailedSymbolSearchResult {
             name: symbol.name,
             qualified_name: symbol.qualified_name,
             kind,
@@ -177,16 +202,24 @@ fn find_in_repos(query: &FindQuery, repos: &[Repo], dir_scope: Option<&Path>) ->
             ))
     });
 
-    let _ = query.list_mode;
+    if query.list_mode {
+        let symbols = matches
+            .into_iter()
+            .map(|(path, symbol)| DetailedSymbolSearchResult::new(path, symbol))
+            .collect::<Vec<_>>();
+
+        return render_matches(&symbols);
+    }
+
     let symbols = matches
         .into_iter()
-        .map(|(path, symbol)| SymbolSearchResult::new(path, symbol))
+        .map(|(path, symbol)| SummarySymbolSearchResult::new(path, symbol))
         .collect::<Vec<_>>();
 
     render_matches(&symbols)
 }
 
-fn render_matches(matches: &[SymbolSearchResult]) -> String {
+fn render_matches<T: serde::Serialize>(matches: &[T]) -> String {
     serde_json::to_string_pretty(matches).expect("serialize symbol matches")
 }
 
@@ -206,12 +239,16 @@ mod tests {
         find_parse_command(&matches)
     }
 
+    fn repo_from_value(value: serde_json::Value) -> Repo {
+        serde_json::from_value(value).expect("parse sample repo")
+    }
+
     fn sample_repo() -> Repo {
         let root_path = std::env::current_dir()
             .expect("current directory")
             .join("repo-root");
 
-        serde_json::from_value(serde_json::json!({
+        repo_from_value(serde_json::json!({
             "id": 1,
             "name": "codeatlas",
             "root_path": root_path,
@@ -265,7 +302,166 @@ mod tests {
                 }
             ]
         }))
-        .expect("parse sample repo")
+    }
+
+    fn sorting_repo() -> Repo {
+        let root_path = std::env::current_dir()
+            .expect("current directory")
+            .join("sorting-root");
+
+        repo_from_value(serde_json::json!({
+            "id": 10,
+            "name": "codeatlas-sorting",
+            "root_path": root_path,
+            "files": [
+                {
+                    "id": 11,
+                    "path": "src/a.rs",
+                    "language": "Rust"
+                },
+                {
+                    "id": 12,
+                    "path": "src/z.rs",
+                    "language": "Rust"
+                }
+            ],
+            "symbols": [
+                {
+                    "id": 13,
+                    "file": 11,
+                    "name": "EdgeId",
+                    "qualified_name": "crate::a::EdgeId",
+                    "module_path": "crate::a",
+                    "info": {
+                        "Struct": {
+                            "members": ["line-10"]
+                        }
+                    },
+                    "span": {
+                        "start_line": 10,
+                        "start_col": 2,
+                        "end_line": 10,
+                        "end_col": 8
+                    }
+                },
+                {
+                    "id": 14,
+                    "file": 11,
+                    "name": "EdgeId",
+                    "qualified_name": "crate::a::EdgeId",
+                    "module_path": "crate::a",
+                    "info": {
+                        "Struct": {
+                            "members": ["line-9"]
+                        }
+                    },
+                    "span": {
+                        "start_line": 9,
+                        "start_col": 8,
+                        "end_line": 9,
+                        "end_col": 14
+                    }
+                },
+                {
+                    "id": 15,
+                    "file": 11,
+                    "name": "EdgeId",
+                    "qualified_name": "crate::b::EdgeId",
+                    "module_path": "crate::b",
+                    "info": {
+                        "Struct": {
+                            "members": ["qualified-b"]
+                        }
+                    },
+                    "span": {
+                        "start_line": 1,
+                        "start_col": 1,
+                        "end_line": 1,
+                        "end_col": 7
+                    }
+                },
+                {
+                    "id": 16,
+                    "file": 12,
+                    "name": "EdgeId",
+                    "qualified_name": "crate::z::EdgeId",
+                    "module_path": "crate::z",
+                    "info": {
+                        "Struct": {
+                            "members": ["file-z"]
+                        }
+                    },
+                    "span": {
+                        "start_line": 1,
+                        "start_col": 1,
+                        "end_line": 1,
+                        "end_col": 7
+                    }
+                }
+            ],
+            "edges": [
+                {
+                    "id": 17,
+                    "kind": "Contain",
+                    "from": {
+                        "Repo": 10
+                    },
+                    "to": {
+                        "File": 11
+                    }
+                },
+                {
+                    "id": 18,
+                    "kind": "Contain",
+                    "from": {
+                        "Repo": 10
+                    },
+                    "to": {
+                        "File": 12
+                    }
+                },
+                {
+                    "id": 19,
+                    "kind": "Contain",
+                    "from": {
+                        "File": 11
+                    },
+                    "to": {
+                        "Symbol": 13
+                    }
+                },
+                {
+                    "id": 20,
+                    "kind": "Contain",
+                    "from": {
+                        "File": 11
+                    },
+                    "to": {
+                        "Symbol": 14
+                    }
+                },
+                {
+                    "id": 21,
+                    "kind": "Contain",
+                    "from": {
+                        "File": 11
+                    },
+                    "to": {
+                        "Symbol": 15
+                    }
+                },
+                {
+                    "id": 22,
+                    "kind": "Contain",
+                    "from": {
+                        "File": 12
+                    },
+                    "to": {
+                        "Symbol": 16
+                    }
+                }
+            ]
+        }))
     }
 
     #[test]
@@ -305,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_in_repos_returns_where_and_symbol_type() {
+    fn test_find_in_repos_default_mode_returns_summary_fields() {
         let output = find_in_repos(
             &FindQuery {
                 symbol: String::from("EdgeId"),
@@ -320,11 +516,12 @@ mod tests {
             serde_json::from_str::<Vec<serde_json::Value>>(&output).expect("parse symbol json");
 
         assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0]["name"], "EdgeId");
-        assert_eq!(symbols[0]["qualified_name"], "crate::repo::EdgeId");
         assert_eq!(symbols[0]["kind"], "struct");
-        assert_eq!(symbols[0]["module_path"], "crate::repo");
+        assert_eq!(symbols[0]["file_name"], "repo.rs");
         assert_eq!(symbols[0]["span"]["start_line"], 27);
+        assert_eq!(symbols[0]["span"]["start_col"], 1);
+        assert_eq!(symbols[0]["span"]["end_line"], 27);
+        assert_eq!(symbols[0]["span"]["end_col"], 24);
         let path = symbols[0]["path"]
             .as_str()
             .expect("path should be a string");
@@ -336,7 +533,10 @@ mod tests {
             path.replace('\\', "/").ends_with("repo-root/src/repo.rs"),
             "expected path to end with repo-root/src/repo.rs, got {path}"
         );
-        assert_eq!(symbols[0]["info"]["Struct"]["members"][0], "u64");
+        assert!(symbols[0].get("name").is_none());
+        assert!(symbols[0].get("qualified_name").is_none());
+        assert!(symbols[0].get("module_path").is_none());
+        assert!(symbols[0].get("info").is_none());
     }
 
     #[test]
@@ -354,6 +554,55 @@ mod tests {
         let symbols =
             serde_json::from_str::<Vec<serde_json::Value>>(&output).expect("parse symbol json");
 
+        assert_eq!(symbols[0]["name"], "EdgeId");
+        assert_eq!(symbols[0]["qualified_name"], "crate::repo::EdgeId");
+        assert_eq!(symbols[0]["module_path"], "crate::repo");
         assert_eq!(symbols[0]["info"]["Struct"]["members"][0], "u64");
+        assert!(symbols[0].get("file_name").is_none());
+    }
+
+    #[test]
+    fn test_find_in_repos_preserves_sort_order() {
+        let output = find_in_repos(
+            &FindQuery {
+                symbol: String::from("EdgeId"),
+                scope: FindScope::All,
+                list_mode: false,
+            },
+            &[sorting_repo()],
+            None,
+        );
+
+        let symbols =
+            serde_json::from_str::<Vec<serde_json::Value>>(&output).expect("parse symbol json");
+
+        let paths = symbols
+            .iter()
+            .map(|symbol| {
+                symbol["path"]
+                    .as_str()
+                    .expect("path should be a string")
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        let spans = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol["span"]["start_line"]
+                        .as_u64()
+                        .expect("start_line should exist"),
+                    symbol["span"]["start_col"]
+                        .as_u64()
+                        .expect("start_col should exist"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(paths[0].ends_with("sorting-root/src/a.rs"));
+        assert!(paths[1].ends_with("sorting-root/src/a.rs"));
+        assert!(paths[2].ends_with("sorting-root/src/a.rs"));
+        assert!(paths[3].ends_with("sorting-root/src/z.rs"));
+        assert_eq!(spans, vec![(9, 8), (10, 2), (1, 1), (1, 1)]);
     }
 }

@@ -1,12 +1,12 @@
+mod extraction;
 mod query;
 mod repo;
 mod search;
-mod extraction;
 
-use std::time::Instant;
 use crate::repo::repo::{repo_commands, repo_handle_commands};
 use crate::search::find::{find_commands, find_handle_command};
 use clap::Command;
+use std::time::Instant;
 
 fn main() {
     let cmd = Command::new("atlas")

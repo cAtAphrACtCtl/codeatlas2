@@ -1,7 +1,9 @@
 use std::path::Path;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::repo::repo::{get_id, FileNode, FunctionInfo, ImportInfo, Span, StructInfo, SymbolInfo, SymbolNode};
+use crate::repo::repo::{
+    FileNode, FunctionInfo, ImportInfo, Span, StructInfo, SymbolInfo, SymbolNode, get_id,
+};
 
 pub(crate) fn extract_span(node: &Node) -> Span {
     let start = node.start_position();
@@ -304,12 +306,7 @@ fn module_path_for_node(node: &Node, source: &[u8], file_module_path: &str) -> S
     }
 }
 
-fn query_symbols<F>(
-    query: &str,
-    tree: &Tree,
-    source: &str,
-    mut builder: F,
-) -> Vec<SymbolNode>
+fn query_symbols<F>(query: &str, tree: &Tree, source: &str, mut builder: F) -> Vec<SymbolNode>
 where
     F: FnMut(&Node) -> Vec<SymbolNode>,
 {
@@ -421,30 +418,25 @@ pub(crate) fn rs_extract_structs(
 ) -> Vec<SymbolNode> {
     let file_module_path = canonical_module_path(module_path);
     let source_bytes = source.as_bytes();
-    query_symbols(
-        r#"(struct_item) @struct"#,
-        tree,
-        source,
-        |node: &Node| {
-            let effective_module = module_path_for_node(node, source_bytes, &file_module_path);
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source_bytes).ok())
-                .unwrap_or("unknown")
-                .to_string();
-            let members = extract_struct_members(node, source_bytes);
+    query_symbols(r#"(struct_item) @struct"#, tree, source, |node: &Node| {
+        let effective_module = module_path_for_node(node, source_bytes, &file_module_path);
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source_bytes).ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let members = extract_struct_members(node, source_bytes);
 
-            vec![SymbolNode {
-                id: get_id(),
-                file: file_node.id,
-                name: name.clone(),
-                qualified_name: make_qualified_name(&effective_module, &name),
-                module_path: Some(effective_module),
-                info: SymbolInfo::Struct(StructInfo { members }),
-                span: extract_span(node),
-            }]
-        },
-    )
+        vec![SymbolNode {
+            id: get_id(),
+            file: file_node.id,
+            name: name.clone(),
+            qualified_name: make_qualified_name(&effective_module, &name),
+            module_path: Some(effective_module),
+            info: SymbolInfo::Struct(StructInfo { members }),
+            span: extract_span(node),
+        }]
+    })
 }
 
 #[cfg(test)]
@@ -552,10 +544,7 @@ fn top_level() {}
         );
 
         let top = by_name("top_level");
-        assert_eq!(
-            top.module_path.as_deref(),
-            Some("crate::repo::repo")
-        );
+        assert_eq!(top.module_path.as_deref(), Some("crate::repo::repo"));
         assert_eq!(top.qualified_name, "crate::repo::repo::top_level");
     }
 
@@ -585,10 +574,7 @@ use std::fs;
             .iter()
             .find(|s| s.name.contains("fs"))
             .expect("fs import");
-        assert_eq!(
-            fs_sym.module_path.as_deref(),
-            Some("crate::repo::repo")
-        );
+        assert_eq!(fs_sym.module_path.as_deref(), Some("crate::repo::repo"));
     }
 
     #[test]
@@ -677,4 +663,3 @@ struct Pair(pub String, bool);
         ));
     }
 }
-
